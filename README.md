@@ -1,2 +1,2 @@
-# 4WIS
-WUUUUUUUU
+# guaduate
+I want to finish it as fast as I can.
