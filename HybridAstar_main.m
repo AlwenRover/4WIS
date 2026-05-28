@@ -69,6 +69,12 @@ deltaRateMax_deg_s = 60;              % [deg/s]
 deltaRateMax = deg2rad(deltaRateMax_deg_s); % [rad/s]
 v_min_for_dt = 0.2;                   % [m/s] prevent dt blow-up when v->0
 
+% ================== steering inertia filter ==================
+% 一阶惯性滤波器时间常数 (用于平滑转角变化)
+% tau越大越平滑（响应慢），tau越小越跟踪快
+% 推荐值: 0.05~0.2 s
+tau_steering_filter = 0.1;             % [s] 一阶滤波时间常数
+
 % ================== curvature transition (clothoid-like, post-process) ==================
 % Insert a short transition segment when curvature jump is too large, to improve
 % curvature continuity at primitive boundaries.
@@ -440,14 +446,21 @@ fprintf('Speed profile: v in [%.2f, %.2f] m/s (%.1f..%.1f km/h)\n', ...
     min(v_profile), max(v_profile), min(v_profile)*3.6, max(v_profile)*3.6);
 fprintf('Max lateral accel (from v^2*kappa): %.2f m/s^2\n', max(a_lat));
 
-% ---------------- Steering rate limit (actuator model) ----------------
-% wheel_all is command (piecewise-constant). Create wheel_act that follows wheel_all
-% with bounded rate: |d(delta)/dt| <= deltaRateMax.
-wheel_act = apply_steering_rate_limit(wheel_all, ds, v_profile, deltaRateMax, v_min_for_dt);
+% --------- Steering rate limit + first-order inertia filtering --------
+% Apply first-order smoothing to wheel commands to achieve:
+%   1. Physical smoothness (no instantaneous steps)
+%   2. Bounded rate: |d(delta)/dt| <= deltaRateMax
+wheel_act = apply_steering_rate_limit_with_filter(wheel_all, ds, v_profile, deltaRateMax, v_min_for_dt, tau_steering_filter);
 
 % Convert to deg for plotting
 wheel_cmd_deg = wheel_all * 180/pi;
 wheel_act_deg = wheel_act * 180/pi;
+
+% Print filter configuration
+fprintf('\n--- Steering Inertia Filter Configuration ---\n');
+fprintf('Time constant tau = %.3f s\n', tau_steering_filter);
+fprintf('Max steering rate = %.1f deg/s\n', deltaRateMax_deg_s);
+fprintf('----------------------------------------\n\n');
 
 % ---------------- Segmentation indices from mode_all ----------------
 [segStartIdx, segEndIdx, segModes] = segment_by_mode(mode_all);
@@ -542,7 +555,7 @@ grid on;
 xlabel('Arc length s (m)');
 ylabel('Steering angle (deg)');
 legend([p1 p2 p3 p4], {'\delta_{fl} (act)','\delta_{fr} (act)','\delta_{rl} (act)','\delta_{rr} (act)'}, 'Location', 'best');
-title(sprintf('4-wheel steering angles along path (mode-shaded), rate limited: %.0f deg/s', deltaRateMax_deg_s));
+title(sprintf('4-wheel steering angles along path (mode-shaded), rate limited: %.0f deg/s, filter tau=%.3f s', deltaRateMax_deg_s, tau_steering_filter));
 
 
 % ================== Animate ==================
@@ -663,6 +676,8 @@ function wheel_act = apply_steering_rate_limit(wheel_cmd, ds, v_profile, deltaRa
 % v_profile: Nx1 (m/s)
 % deltaRateMax: rad/s
 % v_min: m/s minimum speed for dt computation
+% 
+% NOTE: This function is deprecated. Use apply_steering_rate_limit_with_filter instead.
 
 N = size(wheel_cmd,1);
 wheel_act = zeros(size(wheel_cmd));
@@ -678,6 +693,66 @@ for i = 2:N
         err = wheel_cmd(i,w) - wheel_act(i-1,w);
         err = max(-maxDelta, min(maxDelta, err));
         wheel_act(i,w) = wheel_act(i-1,w) + err;
+    end
+end
+end
+
+function wheel_act = apply_steering_rate_limit_with_filter(wheel_cmd, ds, v_profile, deltaRateMax, v_min, tau)
+% ============================================================================
+% First-order inertia filter + rate limiting for steering angles
+% ============================================================================
+% INPUTS:
+%   wheel_cmd: Nx4 (rad) - target/command wheel angles [fl fr rl rr]
+%   ds: (N-1)x1 (m) - distance increments between samples
+%   v_profile: Nx1 (m/s) - velocity profile at each sample
+%   deltaRateMax: scalar (rad/s) - maximum allowed steering rate
+%   v_min: scalar (m/s) - minimum velocity (prevents dt blow-up)
+%   tau: scalar (s) - time constant for first-order filter
+%        Larger tau => smoother (slower response)
+%        Smaller tau => faster tracking
+%        Typical range: 0.05 - 0.2 s
+%
+% OUTPUTS:
+%   wheel_act: Nx4 (rad) - smoothed/filtered wheel angles
+%
+% PHYSICS:
+%   First-order dynamics: tau * dX/dt + X = u
+%   Discrete form: X(k) = X(k-1) + alpha*(u(k) - X(k-1))
+%   where alpha = dt/(tau + dt)
+%
+% FEATURES:
+%   - Eliminates instantaneous step changes
+%   - Converts piecewise-constant commands into smooth ramps
+%   - Preserves rate limiting as secondary constraint
+%   - Results in smooth curves (circular arcs) instead of sharp peaks
+% ============================================================================
+
+N = size(wheel_cmd,1);
+wheel_act = zeros(size(wheel_cmd));
+wheel_act(1,:) = wheel_cmd(1,:);
+
+for i = 2:N
+    ds_i = ds(i-1);
+    v_i = max(v_min, v_profile(i));
+    dt = ds_i / v_i;  % sampling time interval [s]
+    
+    % ===== First-order low-pass filter coefficient =====
+    % alpha = dt / (tau + dt)
+    % When dt << tau: alpha ~ dt/tau (gradual smoothing)
+    % When dt >> tau: alpha ~ 1 (fast tracking)
+    alpha = dt / (tau + dt);
+    
+    for w = 1:4
+        % ===== Apply first-order inertia filter =====
+        % wheel_act(i,w) = (1-alpha)*wheel_act(i-1,w) + alpha*wheel_cmd(i,w)
+        % Equivalently:
+        wheel_act(i,w) = wheel_act(i-1,w) + alpha * (wheel_cmd(i,w) - wheel_act(i-1,w));
+        
+        % ===== Optional: secondary rate limiting (safety backup) =====
+        % Ensure rate does not exceed deltaRateMax even after filtering
+        maxDelta = deltaRateMax * dt;
+        wheel_act(i,w) = max(wheel_act(i-1,w) - maxDelta, ...
+                             min(wheel_act(i-1,w) + maxDelta, wheel_act(i,w)));
     end
 end
 end
@@ -771,4 +846,3 @@ area2 = (p1(1)-p0(1))*(p2(2)-p0(2)) - (p1(2)-p0(2))*(p2(1)-p0(1));
 
 k = area2 / (a*b*c); % signed
 end
-
