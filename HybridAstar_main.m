@@ -73,7 +73,11 @@ v_min_for_dt = 0.2;                   % [m/s] prevent dt blow-up when v->0
 % 一阶惯性滤波器时间常数 (用于平滑转角变化)
 % tau越大越平滑（响应慢），tau越小越跟踪快
 % 推荐值: 0.05~0.2 s
-tau_steering_filter = 0.1;             % [s] 一阶滤波时间常数
+tau_steering_filter = 0.2;             % [s] 一阶滤波时间常数
+
+% ================== path resampling for better filter response ==================
+% Resample path to increase sampling density, making dt smaller for effective filtering
+resample_ds = 0.15;  % [m] resample every 0.15m (key parameter!)
 
 % ================== curvature transition (clothoid-like, post-process) ==================
 % Insert a short transition segment when curvature jump is too large, to improve
@@ -349,7 +353,53 @@ N = size(xy,1);
 ds = sqrt(sum(diff(xy,1,1).^2,2));
 s_all = [0; cumsum(ds)];
 
-% ---------------- Speed planning first (needed for dt in steering rate limit) ----------------
+% ================== PATH RESAMPLING: Increase sampling density for better filter response ==================
+% Purpose: Make dt smaller so the first-order filter actually has time to smooth the curve
+% Remove duplicate/near-zero ds values and resample uniformly
+total_length = s_all(end);
+
+if total_length > resample_ds
+    % Generate uniform resampling points
+    s_interp = (0:resample_ds:total_length)';
+    
+    % ===== Path resampling (linear interpolation to avoid duplicate point errors) =====
+    xy_resampled = interp1(s_all, xy, s_interp, 'linear');
+    
+    % ===== Wheel angles resampling (nearest neighbor) =====
+    wheel_resampled = zeros(length(s_interp), 4);
+    for w = 1:4
+        wheel_resampled(:,w) = interp1(s_all, wheel_all(:,w), s_interp, 'nearest');
+    end
+    
+    % ===== Mode resampling (nearest neighbor) =====
+    mode_resampled = strings(length(s_interp), 1);
+    for i = 1:length(s_interp)
+        [~, idx] = min(abs(s_all - s_interp(i)));
+        mode_resampled(i) = mode_all(idx);
+    end
+    
+    % ===== Update all variables =====
+    % Reconstruct route_all with heading (psi)
+    xy = xy_resampled;
+    dxy = diff(xy, 1, 1);
+    psi_resampled = atan2(dxy(:,2), dxy(:,1));
+    route_all = [xy_resampled(1:end-1,:), psi_resampled];
+    % Append last point
+    route_all = [route_all; route_all(end,:)];
+    
+    wheel_all = wheel_resampled;
+    mode_all = mode_resampled;
+    
+    % Recalculate ds and s_all
+    ds = sqrt(sum(diff(xy,1,1).^2,2));
+    s_all = [0; cumsum(ds)];
+    N = size(xy, 1);
+    
+    fprintf('Path resampled: %d → %d points (resample_ds=%.3f m)\n', ...
+        size(xy_resampled,1) + length(dxy), N, resample_ds);
+end
+
+% ================== Speed planning ==================
 % 1 grid = 1 m
 % straight: ~15 km/h constant
 % obstacle/curve: if kappa > 0.1 1/m then v <= 10 km/h
@@ -460,6 +510,7 @@ wheel_act_deg = wheel_act * 180/pi;
 fprintf('\n--- Steering Inertia Filter Configuration ---\n');
 fprintf('Time constant tau = %.3f s\n', tau_steering_filter);
 fprintf('Max steering rate = %.1f deg/s\n', deltaRateMax_deg_s);
+fprintf('Resampling interval = %.3f m\n', resample_ds);
 fprintf('----------------------------------------\n\n');
 
 % ---------------- Segmentation indices from mode_all ----------------
